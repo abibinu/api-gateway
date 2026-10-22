@@ -57,7 +57,11 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("authenticated", policy =>
+        policy.RequireAuthenticatedUser());
+});
 
 // ─────────────────────────────────────────────────────────────────
 // 3. Rate Limiting  – Fixed Window, 100 req / 60 s per IP
