@@ -125,6 +125,8 @@ app.UseExceptionHandler(errorApp =>
 // ─────────────────────────────────────────────────────────────────
 app.UseRateLimiter();
 
+app.UseMiddleware<GatewayErrorMiddleware>();
+
 app.UseMiddleware<CorrelationIdMiddleware>();
 
 app.UseAuthentication();

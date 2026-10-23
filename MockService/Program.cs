@@ -1,5 +1,51 @@
+using System.Security.Claims;
+using System.Text;
+using Microsoft.IdentityModel.JsonWebTokens;
+using Microsoft.IdentityModel.Tokens;
+
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
+
+// ── Dev helper: mint a real signed JWT ───────────────────────────
+// IMPORTANT: the secret / issuer / audience here must match exactly
+// what ApiGateway has in its appsettings.json JwtSettings section.
+const string SecretKey  = "CHANGE_ME_super_long_secret_key_at_least_32_chars!";
+const string Issuer     = "https://your-auth-server.com";
+const string Audience   = "api-gateway";
+
+app.MapGet("/dev/token", (string? username, string? role) =>
+{
+    username ??= "demo-user";
+    role     ??= "User";
+
+    var signingKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(SecretKey));
+    var credentials = new SigningCredentials(signingKey, SecurityAlgorithms.HmacSha256);
+
+    var descriptor = new SecurityTokenDescriptor
+    {
+        Issuer             = Issuer,
+        Audience           = Audience,
+        Expires            = DateTime.UtcNow.AddHours(1),
+        SigningCredentials  = credentials,
+        Claims             = new Dictionary<string, object>
+        {
+            [ClaimTypes.NameIdentifier] = Guid.NewGuid().ToString(),
+            [ClaimTypes.Name]           = username,
+            [ClaimTypes.Role]           = role
+        }
+    };
+
+    var handler = new JsonWebTokenHandler();
+    var token   = handler.CreateToken(descriptor);
+
+    return Results.Ok(new
+    {
+        token,
+        expiresIn = 3600,
+        tokenType = "Bearer",
+        note      = "This endpoint is for LOCAL DEVELOPMENT only. Remove in production."
+    });
+});
 
 // ── Auth endpoints (/api/auth/*) ──────────────────────────────────
 app.MapPost("/api/auth/login", (LoginRequest req) =>
@@ -8,8 +54,7 @@ app.MapPost("/api/auth/login", (LoginRequest req) =>
     {
         return Results.Ok(new
         {
-            message = "Login successful (mock token — use a real JWT in production)",
-            token   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.mock_payload.mock_signature",
+            message = "Login successful. Use /dev/token to get a real JWT for testing.",
             user    = req.Username
         });
     }
@@ -22,9 +67,9 @@ app.MapPost("/api/auth/register", (RegisterRequest req) =>
 // ── Users endpoints (/api/users/*) ────────────────────────────────
 app.MapGet("/api/users", () => Results.Ok(new[]
 {
-    new { id = 1, name = "Alice",   email = "alice@example.com", role = "Admin" },
-    new { id = 2, name = "Bob",     email = "bob@example.com",   role = "User"  },
-    new { id = 3, name = "Charlie", email = "charlie@example.com",role = "User"  },
+    new { id = 1, name = "Alice",   email = "alice@example.com",   role = "Admin" },
+    new { id = 2, name = "Bob",     email = "bob@example.com",     role = "User"  },
+    new { id = 3, name = "Charlie", email = "charlie@example.com", role = "User"  },
 }));
 
 app.MapGet("/api/users/{id:int}", (int id) =>
@@ -43,7 +88,7 @@ app.MapGet("/api/inventory/items", () => Results.Ok(new[]
 app.MapGet("/api/inventory/items/{sku}", (string sku) =>
     Results.Ok(new { sku, name = $"Product {sku}", stock = 10, price = 19.99 }));
 
-// ── Health check ──────────────────────────────────────────────────
+// ── Diagnostics ───────────────────────────────────────────────────
 app.MapGet("/health", () => Results.Ok(new
 {
     status    = "Healthy",
@@ -51,8 +96,6 @@ app.MapGet("/health", () => Results.Ok(new
     timestamp = DateTime.UtcNow
 }));
 
-// Diagnostic: echo every request's headers (useful for verifying
-// that the gateway correctly injects X-Correlation-ID)
 app.MapGet("/api/debug/headers", (HttpContext ctx) =>
     Results.Ok(ctx.Request.Headers.ToDictionary(h => h.Key, h => h.Value.ToString())));
 

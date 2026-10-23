@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ApiGateway/ApiGateway.csproj" />
+  <Project Path="MockService/MockService.csproj" />
+</Solution>
