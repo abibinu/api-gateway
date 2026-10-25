@@ -2,140 +2,201 @@ using System.Text;
 using System.Text.Json;
 using ApiGateway.Middleware;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.IdentityModel.Tokens;
+using Serilog;
 using System.Threading.RateLimiting;
 
-var builder = WebApplication.CreateBuilder(args);
+// ─────────────────────────────────────────────────────────────────
+// Bootstrap Serilog from appsettings.json BEFORE the host is built
+// so that even startup errors are captured.
+// ─────────────────────────────────────────────────────────────────
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
 
-// ─────────────────────────────────────────────────────────────────
-// 1. YARP Reverse Proxy
-//    Reads "ReverseProxy" section from appsettings.json
-// ─────────────────────────────────────────────────────────────────
-builder.Services.AddReverseProxy()
-    .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
+try
+{
+    Log.Information("API Gateway starting...");
 
-// ─────────────────────────────────────────────────────────────────
-// 2. JWT Bearer Authentication
-// ─────────────────────────────────────────────────────────────────
-var jwtSettings = builder.Configuration.GetSection("JwtSettings");
-var secretKey = jwtSettings["SecretKey"]
-    ?? throw new InvalidOperationException("JwtSettings:SecretKey is not configured.");
+    var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
+    // Replace the default .NET logger with Serilog
+    builder.Host.UseSerilog((ctx, services, cfg) =>
+        cfg.ReadFrom.Configuration(ctx.Configuration)
+           .ReadFrom.Services(services)
+           .Enrich.FromLogContext());
+
+    // ─────────────────────────────────────────────────────────────────
+    // 1. YARP Reverse Proxy
+    // ─────────────────────────────────────────────────────────────────
+    builder.Services.AddReverseProxy()
+        .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
+
+    // ─────────────────────────────────────────────────────────────────
+    // 2. JWT Bearer Authentication
+    // ─────────────────────────────────────────────────────────────────
+    var jwtSettings = builder.Configuration.GetSection("JwtSettings");
+    var secretKey = jwtSettings["SecretKey"]
+        ?? throw new InvalidOperationException("JwtSettings:SecretKey is not configured.");
+
+    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
         {
-            ValidateIssuer           = true,
-            ValidIssuer              = jwtSettings["Issuer"],
-            ValidateAudience         = true,
-            ValidAudience            = jwtSettings["Audience"],
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
-            ValidateLifetime         = true,
-            ClockSkew                = TimeSpan.Zero
-        };
-
-        options.Events = new JwtBearerEvents
-        {
-            OnChallenge = async context =>
+            options.TokenValidationParameters = new TokenValidationParameters
             {
-                context.HandleResponse();
-                context.Response.StatusCode  = StatusCodes.Status401Unauthorized;
-                context.Response.ContentType = "application/json";
+                ValidateIssuer           = true,
+                ValidIssuer              = jwtSettings["Issuer"],
+                ValidateAudience         = true,
+                ValidAudience            = jwtSettings["Audience"],
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
+                ValidateLifetime         = true,
+                ClockSkew                = TimeSpan.Zero
+            };
 
-                var body = JsonSerializer.Serialize(new
+            options.Events = new JwtBearerEvents
+            {
+                OnChallenge = async context =>
                 {
-                    status  = 401,
-                    error   = "Unauthorized",
-                    message = "A valid Bearer token is required to access this resource."
-                });
+                    context.HandleResponse();
+                    context.Response.StatusCode  = StatusCodes.Status401Unauthorized;
+                    context.Response.ContentType = "application/json";
 
-                await context.Response.WriteAsync(body);
-            }
+                    var body = JsonSerializer.Serialize(new
+                    {
+                        status  = 401,
+                        error   = "Unauthorized",
+                        message = "A valid Bearer token is required to access this resource."
+                    });
+
+                    await context.Response.WriteAsync(body);
+                }
+            };
+        });
+
+    builder.Services.AddAuthorization(options =>
+    {
+        options.AddPolicy("authenticated", policy =>
+            policy.RequireAuthenticatedUser());
+    });
+
+    // ─────────────────────────────────────────────────────────────────
+    // 3. Rate Limiting  – Fixed Window, 100 req / 60 s per IP
+    // ─────────────────────────────────────────────────────────────────
+    builder.Services.AddRateLimiter(options =>
+    {
+        options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+        options.AddPolicy("fixed-by-ip", context =>
+            RateLimitPartition.GetFixedWindowLimiter(
+                partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+                factory: _ => new FixedWindowRateLimiterOptions
+                {
+                    PermitLimit          = 100,
+                    Window               = TimeSpan.FromSeconds(60),
+                    QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                    QueueLimit           = 0
+                }));
+
+        options.OnRejected = async (rejectedContext, cancellationToken) =>
+        {
+            rejectedContext.HttpContext.Response.ContentType = "application/json";
+            var body = JsonSerializer.Serialize(new
+            {
+                status  = 429,
+                error   = "Too Many Requests",
+                message = "You have exceeded the request limit. Please slow down and try again later."
+            });
+            await rejectedContext.HttpContext.Response.WriteAsync(body, cancellationToken);
         };
     });
 
-builder.Services.AddAuthorization(options =>
-{
-    options.AddPolicy("authenticated", policy =>
-        policy.RequireAuthenticatedUser());
-});
+    // ─────────────────────────────────────────────────────────────────
+    // 4. Health Checks
+    // ─────────────────────────────────────────────────────────────────
+    builder.Services.AddHealthChecks()
+        .AddCheck("self", () => HealthCheckResult.Healthy("Gateway is running."));
 
-// ─────────────────────────────────────────────────────────────────
-// 3. Rate Limiting  – Fixed Window, 100 req / 60 s per IP
-// ─────────────────────────────────────────────────────────────────
-builder.Services.AddRateLimiter(options =>
-{
-    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    // ─────────────────────────────────────────────────────────────────
+    // Build the application
+    // ─────────────────────────────────────────────────────────────────
+    var app = builder.Build();
 
-    options.AddPolicy("fixed-by-ip", context =>
-        RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-            factory: _ => new FixedWindowRateLimiterOptions
+    // ─────────────────────────────────────────────────────────────────
+    // Global Exception Handler – catches connection failures to downstream
+    // ─────────────────────────────────────────────────────────────────
+    app.UseExceptionHandler(errorApp =>
+    {
+        errorApp.Run(async context =>
+        {
+            context.Response.StatusCode  = StatusCodes.Status502BadGateway;
+            context.Response.ContentType = "application/json";
+
+            var body = JsonSerializer.Serialize(new
             {
-                PermitLimit          = 100,
-                Window               = TimeSpan.FromSeconds(60),
-                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-                QueueLimit           = 0
-            }));
+                status  = 502,
+                error   = "Bad Gateway",
+                message = "An upstream service failed to respond. Please try again shortly."
+            });
 
-    options.OnRejected = async (rejectedContext, cancellationToken) =>
-    {
-        rejectedContext.HttpContext.Response.ContentType = "application/json";
-        var body = JsonSerializer.Serialize(new
-        {
-            status  = 429,
-            error   = "Too Many Requests",
-            message = "You have exceeded the request limit. Please slow down and try again later."
+            await context.Response.WriteAsync(body);
         });
-        await rejectedContext.HttpContext.Response.WriteAsync(body, cancellationToken);
-    };
-});
-
-// ─────────────────────────────────────────────────────────────────
-// Build the application
-// ─────────────────────────────────────────────────────────────────
-var app = builder.Build();
-
-// ─────────────────────────────────────────────────────────────────
-// 4. Global Exception Handler  – catches 502 / 504 from downstream
-// ─────────────────────────────────────────────────────────────────
-app.UseExceptionHandler(errorApp =>
-{
-    errorApp.Run(async context =>
-    {
-        context.Response.StatusCode  = StatusCodes.Status502BadGateway;
-        context.Response.ContentType = "application/json";
-
-        var body = JsonSerializer.Serialize(new
-        {
-            status  = 502,
-            error   = "Bad Gateway",
-            message = "An upstream service failed to respond. Please try again shortly."
-        });
-
-        await context.Response.WriteAsync(body);
     });
-});
 
-// ─────────────────────────────────────────────────────────────────
-// Middleware pipeline – ORDER MATTERS
-// ─────────────────────────────────────────────────────────────────
-app.UseRateLimiter();
+    // ─────────────────────────────────────────────────────────────────
+    // Middleware pipeline – ORDER MATTERS
+    // ─────────────────────────────────────────────────────────────────
+    app.UseRateLimiter();
 
-app.UseMiddleware<GatewayErrorMiddleware>();
+    app.UseMiddleware<GatewayErrorMiddleware>();
 
-app.UseMiddleware<CorrelationIdMiddleware>();
+    app.UseMiddleware<CorrelationIdMiddleware>();
 
-app.UseAuthentication();
-app.UseAuthorization();
+    app.UseMiddleware<RequestLoggingMiddleware>();
 
-// ─────────────────────────────────────────────────────────────────
-// 5. YARP routing – must be last
-// ─────────────────────────────────────────────────────────────────
-app.MapReverseProxy()
-    .RequireRateLimiting("fixed-by-ip");
+    app.UseAuthentication();
+    app.UseAuthorization();
 
-app.Run();
+    // ─────────────────────────────────────────────────────────────────
+    // Health check endpoint – publicly accessible, no auth required
+    // ─────────────────────────────────────────────────────────────────
+    app.MapHealthChecks("/health", new HealthCheckOptions
+    {
+        ResponseWriter = async (context, report) =>
+        {
+            context.Response.ContentType = "application/json";
+            var result = JsonSerializer.Serialize(new
+            {
+                status    = report.Status.ToString(),
+                duration  = report.TotalDuration.TotalMilliseconds,
+                checks    = report.Entries.Select(e => new
+                {
+                    name     = e.Key,
+                    status   = e.Value.Status.ToString(),
+                    duration = e.Value.Duration.TotalMilliseconds,
+                    description = e.Value.Description
+                })
+            });
+            await context.Response.WriteAsync(result);
+        }
+    }).AllowAnonymous();
+
+    // ─────────────────────────────────────────────────────────────────
+    // YARP routing – must be last
+    // ─────────────────────────────────────────────────────────────────
+    app.MapReverseProxy()
+        .RequireRateLimiting("fixed-by-ip");
+
+    app.Run();
+}
+catch (Exception ex)
+{
+    Log.Fatal(ex, "API Gateway terminated unexpectedly.");
+}
+finally
+{
+    Log.CloseAndFlush();
+}
